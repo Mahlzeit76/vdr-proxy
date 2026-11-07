@@ -1,14 +1,37 @@
+# MIT License
+# 
+# Copyright (c) 2026
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 #!/usr/bin/env python3
-import os
-import re
-import html
-import sys
+
 import argparse
 import configparser
-import urllib.request
-import ssl
+import html
+import os
+import re
 import socket
+import ssl
+import sys
 import time
+import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -31,7 +54,7 @@ def load_config(config_path):
         }
         config["STREAMDEV"] = {
             "protocol": "http",
-            "port": 3000,
+            "port": "3000",
         }
         config["EPG"] = {
             "mode": "svdrp",
@@ -44,7 +67,7 @@ def load_config(config_path):
             "protocol": "http",
             "server_ip": "0.0.0.0",
             "port": 8080,
-            "streamproxy": True
+            "streamproxy": "true"
         }
         try:
             with open(config_path, "w", encoding="utf-8") as f:
@@ -78,15 +101,15 @@ config = load_config(args.config)
 VDR_PROTOCOL = config.get("VDR", "protocol", fallback="http").strip().lower().replace("://", "")
 VDR_IP = config.get("VDR", "ip", fallback="127.0.0.1")
 
-EPG_FILE = config.get("EPG", "epgfile", fallback="/var/lib/vdr/epg.data").strip().lower()
+EPG_FILE = config.get("EPG", "epgfile", fallback="/var/lib/vdr/epg.data").strip()
 EPG_MODE = config.get("EPG", "mode", fallback="svdrp").strip().lower()
 
 SVDRP_PORT = config.getint("SVDRP", "port", fallback=6419)
 SVDRP_TIMEOUT = config.getint("SVDRP", "timeout", fallback=30)
 
 STREAMDEV_PORT = config.getint("STREAMDEV", "port", fallback=3000)
-STREAMDEV_PROTOCOL = config.get("STREAMDEV", "protocol", fallback="http")
-STREAMDEV_STREAMTYPE = config.get("STREAMDEV", "streamtype", fallback="TS")
+STREAMDEV_PROTOCOL = config.get("STREAMDEV", "protocol", fallback="http").strip().lower()
+STREAMDEV_STREAMTYPE = config.get("STREAMDEV", "streamtype", fallback="TS").strip().upper()
 STREAMDEV_CHUNK_SIZE = config.getint("STREAMDEV", "chunk_size", fallback=65536)
 
 PROXY_PROTOCOL = config.get("PROXY", "protocol", fallback="http").strip().lower()
@@ -118,7 +141,7 @@ def fetch_channels():
     try:
         vdr_url = f"{STREAMDEV_PROTOCOL}://{VDR_IP}:{STREAMDEV_PORT}/channels.m3u"
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Connecting upstream to VDR: {vdr_url}")
-        req = urllib.request.Request(vdr_url, headers={'User-Agent': '{USERAGENT}'})
+        req = urllib.request.Request(vdr_url, headers={f'User-Agent': '{USERAGENT}'})
         with urllib.request.urlopen(req, timeout=5) as response:
             m3u_content = response.read().decode('utf-8', errors='ignore')
         current_name = "Unknown Channel"
@@ -252,7 +275,7 @@ def parse_epg_data():
                     channel_map[raw_id] = parts[2].strip()
 
     xml = ['<?xml version="1.0" encoding="utf-8" ?>']
-    xml.append('<tv generator-info-name="{USERAGENT}">')
+    xml.append(f'<tv generator-info-name="{USERAGENT}">')
     
     for raw_id, ch_name in channel_map.items():
         clean_id = sanitize_id(raw_id)
@@ -283,8 +306,13 @@ def parse_epg_data():
                     duration = int(e_parts[2])
                     end_ts = start_ts + duration
                     
-                    start_str = datetime.fromtimestamp(start_ts).strftime('%Y%m%d%H%M%S +0100')
-                    end_str = datetime.fromtimestamp(end_ts).strftime('%Y%m%d%H%M%S +0100')
+                    # Get local timezone offset in +HHMM or -HHMM format
+                    offset_sec = -time.timezone if (time.localtime().tm_isdst == 0) else -time.altzone
+                    sign = '+' if offset_sec >= 0 else '-'
+                    offset_min = abs(offset_sec) // 60
+                    offset_str = f"{sign}{offset_min // 60:02d}{offset_min % 60:02d}"
+                    start_str = datetime.fromtimestamp(start_ts).strftime('%Y%m%d%H%M%S') + f" {offset_str}"
+                    end_str = datetime.fromtimestamp(end_ts).strftime('%Y%m%d%H%M%S') + f" {offset_str}"
                     
                     clean_ch_id = sanitize_id(current_channel)
                     xml.append(f'  <programme start="{start_str}" stop="{end_str}" channel="{clean_ch_id}">')
@@ -310,7 +338,7 @@ class VDRProxyHandler(BaseHTTPRequestHandler):
             try:
                 vdr_url = f"{STREAMDEV_PROTOCOL}://{VDR_IP}:{STREAMDEV_PORT}/channels.m3u"
                 print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Connecting upstream to VDR: {vdr_url}")
-                req = urllib.request.Request(vdr_url, headers={'User-Agent': '{USERAGENT}'})
+                req = urllib.request.Request(vdr_url, headers={f'User-Agent': '{USERAGENT}'})
                 with urllib.request.urlopen(req) as response:
                     m3u_content = response.read().decode('utf-8', errors='ignore')
                 modified_m3u = modify_m3u_channels(m3u_content)
@@ -408,7 +436,7 @@ def run():
             sys.exit(1)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(certfile=SSL_CERT_FILE, keyfile=SSL_KEY_FILE)
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Shutting down proxy server safely.")
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] VDR Proxy web server successfully started on {PROXY_PROTOCOL}://{PROXY_LISTEN_IP}:{PROXY_PORT}...")
     try:
         httpd.serve_forever()
