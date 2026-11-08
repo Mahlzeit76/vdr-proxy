@@ -75,3 +75,22 @@ sudo ./install.sh --uninstall
 | streamproxy | "True" to proxy original VDR stream via proxy ip. "False" to direct connect to VDR stream via VDR ip. Default "True" |
 | ssl_cert_file | Path to SSL certificate file. For https only - UNTESTED |
 | ssl_key_file | Path to SSL key file. For https only - UNTESTED |
+
+### Section [TRANSCODE]
+
+| Parameter | Value |
+| :--- | :--- |
+| vbitrate | Video bitrate. Default source video |
+| vsize | Video size. Default source video |
+| vcodec | Video codec. Default hevc_qsv |
+| abitrate | Audio bitrate. Default source audio |
+| acodec | Audio codec. Defaul source audio |
+
+#### Video Codecs
+
+| Hardware / Hersteller | Schnittstelle | H.264 Codec | H.265 (HEVC) Codec | AV1 Codec |
+| :--- | :--- | :--- | :--- | :--- |
+| Intel (CPU / Arc) | QSV | h264_qsv | hevc_qsv | av1_qsv |
+| NVIDIA (alle OS) | NVENC | h264_nvenc | hevc_nvenc | av1_nvenc |
+| AMD (Windows) | AMF | h264_amf | hevc_amf | av1_amf |
+| AMD (Linux) | VA-API | h264_vaapi | hevc_vaapi | av1_vaapi |

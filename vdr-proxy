@@ -28,12 +28,16 @@ import html
 import os
 import re
 import socket
+import subprocess
 import ssl
 import sys
 import time
 import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse, parse_qs
 
 DEFAULT_CONFIG_PATH = "/etc/vdr-proxy/config.ini"
 USERAGENT = "VDR-Proxy"
@@ -119,6 +123,12 @@ PROXY_PORT = config.getint("PROXY", "port", fallback=8080)
 PROXY_STREAM = config.getboolean("PROXY", "streamproxy", fallback=True)
 SSL_CERT_FILE = config.get("PROXY", "ssl_cert_file", fallback="")
 SSL_KEY_FILE = config.get("PROXY", "ssl_key_file", fallback="")
+
+DEFAULT_VBITRATE = config.get("TRANSCODE", "vbitrate", fallback="Original")
+DEFAULT_ABITRATE = config.get("TRANSCODE", "abitrate", fallback="Original")
+DEFAULT_VSIZE = config.get("TRANSCODE", "vsize", fallback="Original")
+DEFAULT_VCODEC = config.get("TRANSCODE", "vcodec", fallback="hevc_qsv")
+DEFAULT_ACODEC = config.get("TRANSCODE", "acodec", fallback="ORIGINAL")
 
 
 
@@ -358,64 +368,151 @@ class VDRProxyHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_error(500, f"EPG Error: {e}")
         elif self.path.startswith(f"/{STREAMDEV_STREAMTYPE}"):
+            
+            parsed_url = urlparse(self.path)
+            query_params = parse_qs(parsed_url.query)
+            path = parsed_url.path    
+            # extract bitrate and video size from parameters, if provided
+            vbitrate = query_params.get('vbitrate', [DEFAULT_VBITRATE])[0]
+            abitrate = query_params.get('abitrate', [DEFAULT_ABITRATE])[0]
+            vsize = query_params.get('vsize', [DEFAULT_VSIZE])[0]
+            vcodec = query_params.get('vcodec', [DEFAULT_VCODEC])[0]
             # Construct the target URL on the VDR streamdev server
             # e.g., if client requests http://proxy:8080/TS/1, 
             # it fetches http://192.168.1.50:3000/TS/1
-            vdr_url = f"{STREAMDEV_PROTOCOL}://{VDR_IP}:{STREAMDEV_PORT}{self.path}"
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Connecting upstream to VDR: {vdr_url}")
+            vdr_url = f"{STREAMDEV_PROTOCOL}://{VDR_IP}:{STREAMDEV_PORT}{path}"
+            
+            if vbitrate != DEFAULT_VBITRATE or abitrate != DEFAULT_ABITRATE or vsize != DEFAULT_VSIZE:
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Transcoding using {vcodec}: vbitrate={vbitrate}, abitrate={abitrate}, vsize={vsize} for {self.client_address[0]}")
+                # Create basic FFmpeg command to read from VDR streamdev and output to stdout
+                cmd = [
+                    'ffmpeg',
+                    '-hide_banner',
+                    '-loglevel', 'warning',
+                    '-i', vdr_url,
+                    '-map', '0:v',   # Map Video-Stream
+                    '-map', '0:a',   # Map all Audio-tracks
+                    '-map_metadata', '0',   # Preserve global Metadata
+                    '-map_metadata', '0:p:0' # Preserver Program-Metadata (Channel name / EPG)
+                ]
 
-            req_headers = {}
-            # Forward relevant headers if needed (like User-Agent)
-            if 'User-Agent' in self.headers:
-                req_headers['User-Agent'] = self.headers['User-Agent']
+                # IF SCALING
+                # Add FFmpeg scaling filter if a target resolution is specified
+                scale_filter = parse_size(vsize)
+                if scale_filter:
+                    # Use scaling filter (scale before encoding with Intel QSV)
+                    cmd.extend(['-vf', f'scale={scale_filter}'])
 
-            req = urllib.request.Request(vdr_url, headers=req_headers)
+                # IF SCALING
+                # Add Intel QSV encoder and remaining parameters
+                cmd.extend([
+                    '-c:v', vcodec,
+                    '-b:v', vbitrate,
+                    '-maxrate', vbitrate,
+                    '-bufsize', parse_bitrate_multiplier(vbitrate),
+                    '-c:a', 'aac',
+                    '-b:a', abitrate,
+                    '-f', 'mpegts',
+                    'pipe:1'
+                ])
 
-            try:
-                # Open connection to VDR streamdev server
-                with urllib.request.urlopen(req, timeout=10) as vdr_response:
-                    # Send HTTP status code back to client
-                    self.send_response(vdr_response.status)
-                    
-                    # Forward response headers (Content-Type: video/mpeg, etc.)
-                    for header, value in vdr_response.headers.items():
-                        # Skip hop-by-hop or conflicting headers if necessary
-                        if header.lower() in ['transfer-encoding', 'connection']:
-                            continue
-                        self.send_header(header, value)
-                    
-                    # Use chunked transfer or standard stream streaming
+                process = None
+                try:
+                    # Start FFmpeg-Process
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        bufsize=10**8
+                    )
+
+                    # Send HTTP Header to Client
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'video/mpeg')
                     self.send_header('Connection', 'close')
                     self.end_headers()
 
-                    # Stream data chunk by chunk from VDR to the client
+                    # Forward Stream-Data from FFmpeg to Client
                     while True:
-                        chunk = vdr_response.read(STREAMDEV_CHUNK_SIZE)
+                        chunk = process.stdout.read(STREAMDEV_CHUNK_SIZE)
                         if not chunk:
                             break
                         try:
                             self.wfile.write(chunk)
                             self.wfile.flush()
                         except (ConnectionResetError, BrokenPipeError):
-                            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Client {self.client_address[0]} disconnected.")
+                            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Client {self.client_address[0]} closed connection.")
                             break
 
-            except urllib.error.HTTPError as e:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] VDR Server returned HTTP Error: {e.code} {e.reason}")
+                except Exception as e:
+                    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Transcoding error: {e}")
+                
+                finally:
+                    # Cleanup: terminate FFmpeg-Prozess if still running
+                    if process and process.poll() is None:
+                        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Terminate FFmpeg-Process...")
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Terminate Stream-Session for {self.client_address[0]}.")
+            else:
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Connecting upstream to VDR: {vdr_url}")
+                
+
+                req_headers = {}
+                # Forward relevant headers if needed (like User-Agent)
+                if 'User-Agent' in self.headers:
+                    req_headers['User-Agent'] = self.headers['User-Agent']
+
+                req = urllib.request.Request(vdr_url, headers=req_headers)
+
                 try:
-                    self.send_error(e.code, e.reason)
-                except Exception:
-                    pass
-            except urllib.error.URLError as e:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Failed to connect to VDR server: {e.reason}")
-                try:
-                    self.send_error(502, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Bad Gateway: Could not connect to VDR server ({e.reason})")
-                except Exception:
-                    pass
-            except Exception as e:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Proxy error: {e}")
-            
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Finished stream session for {self.client_address[0]}")
+                    # Open connection to VDR streamdev server
+                    with urllib.request.urlopen(req, timeout=10) as vdr_response:
+                        # Send HTTP status code back to client
+                        self.send_response(vdr_response.status)
+                        
+                        # Forward response headers (Content-Type: video/mpeg, etc.)
+                        for header, value in vdr_response.headers.items():
+                            # Skip hop-by-hop or conflicting headers if necessary
+                            if header.lower() in ['transfer-encoding', 'connection']:
+                                continue
+                            self.send_header(header, value)
+                        
+                        # Use chunked transfer or standard stream streaming
+                        self.send_header('Connection', 'close')
+                        self.end_headers()
+
+                        # Stream data chunk by chunk from VDR to the client
+                        while True:
+                            chunk = vdr_response.read(STREAMDEV_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            try:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                            except (ConnectionResetError, BrokenPipeError):
+                                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Client {self.client_address[0]} disconnected.")
+                                break
+
+                except urllib.error.HTTPError as e:
+                    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] VDR Server returned HTTP Error: {e.code} {e.reason}")
+                    try:
+                        self.send_error(e.code, e.reason)
+                    except Exception:
+                        pass
+                except urllib.error.URLError as e:
+                    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Failed to connect to VDR server: {e.reason}")
+                    try:
+                        self.send_error(502, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Bad Gateway: Could not connect to VDR server ({e.reason})")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Proxy error: {e}")
+                
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Finished stream session for {self.client_address[0]}")
 
         else:
             self.send_error(404)
@@ -423,10 +520,56 @@ class VDRProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+def parse_bitrate_multiplier(bitrate_str):
+    """Calculates a reasonable -bufsize value based on the bitrate string and returns it with unit."""
+    try:
+        val = float(bitrate_str[:-1])
+        unit = bitrate_str[-1].lower()
+        if unit == 'm':
+            return f"{int(val * 2)}M"
+        elif unit == 'k':
+            return f"{int(val * 2)}k"
+    except Exception:
+        pass
+    return "4M"
+
+def parse_size(res_str):
+    """Converts resolution strings like '720p', '1080p', or '1280x720' into FFmpeg-compatible scaling values."""
+    if not res_str:
+        return None
+    
+    res_str = res_str.lower().strip()
+    
+    # Gängige Shortcuts mappen
+    presets = {
+        '1080p': '1920:1080',
+        '720p': '1280:720',
+        '480p': '854:480',
+        '576p': '720:576',
+        '360p': '640:360',
+        '240p': '426:240',
+        '144p': '256:144'
+    }
+    
+    if res_str in presets:
+        return presets[res_str]
+    
+    # Manuelle Auflösungen im Format WxH (z.B. 1280x720) unterstützen
+    if 'x' in res_str:
+        parts = res_str.split('x')
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            return f"{parts[0]}:{parts[1]}"
+            
+    return None
+
+class ThreadingVDRServer(ThreadingMixIn, HTTPServer):
+    """Erlaubt dem HTTP-Server, mehrere Verbindungen parallel in Threads zu bedienen."""
+    daemon_threads = True
+
 def run():
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Configuration file: {args.config}")
     server_address = (PROXY_LISTEN_IP, PROXY_PORT)
-    httpd = HTTPServer(server_address, VDRProxyHandler)
+    httpd = ThreadingVDRServer(server_address, VDRProxyHandler)
     if PROXY_PROTOCOL == "https":
         if not SSL_CERT_FILE or not SSL_KEY_FILE:
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error: HTTPS encryption enabled, but ssl_cert_file or ssl_key_file is not specified inside config!", file=sys.stderr)
