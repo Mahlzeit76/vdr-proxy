@@ -94,3 +94,11 @@ sudo ./install.sh --uninstall
 | NVIDIA (alle OS) | NVENC | h264_nvenc | hevc_nvenc | av1_nvenc |
 | AMD (Windows) | AMF | h264_amf | hevc_amf | av1_amf |
 | AMD (Linux) | VA-API | h264_vaapi | hevc_vaapi | av1_vaapi |
+
+### Section [AUTHENTICATION]
+
+| Parameter | Value |
+| :--- | :--- |
+| enabled | Enable/disable authentication. Default "False" |
+| username | Username |
+| password | Password |
